@@ -1,0 +1,636 @@
+#!/usr/bin/perl -Tw
+#-
+# Copyright (c) 2013-2015 Universitetet i Oslo
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+# 3. The name of the author may not be used to endorse or promote
+#    products derived from this software without specific prior written
+#    permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+# OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+# OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+# SUCH DAMAGE.
+#
+# Author: Dag-Erling Smørgrav <d.e.smorgrav@usit.uio.no>
+#
+
+use v5.14;
+use strict;
+use warnings;
+use open qw(:locale);
+use utf8;
+
+use Authen::SASL qw(Perl);
+use Getopt::Std;
+use Net::DNS;
+use Net::LDAP;
+use Net::LDAP::Control::Paged;
+use Net::LDAP::Constant qw(LDAP_CONTROL_PAGED);
+use POSIX;
+use Regexp::Common;
+use Storable qw(dclone);
+use Try::Tiny;
+
+our $opt_b;			# LDAP base
+our $opt_d;			# LDAP domain
+our $opt_G;			# Group filter
+our $opt_h;			# Hostname
+our $opt_n;			# Dry run
+our $opt_P;			# Page size
+our $opt_p;			# Preserve existing users
+our $opt_s;			# LDAP server
+our $opt_U;			# User filter
+our $opt_u;			# LDAP user
+our $opt_v;			# Verbose mode
+
+our $host;			# Hostname
+our $domain;			# DNS and LDAP domain
+our $user;			# LDAP user
+our @servers;			# LDAP servers
+our $base;			# LDAP search base
+
+our $sasl;			# SASL context
+our $ldap;			# LDAP connection
+
+our %ldap_users;		# Users retrieved from LDAP
+our %ldap_groups;		# Groups retrieved from LDAP
+our %ldap_uids;			# Maps UIDs to LDAP users
+our %ldap_gids;			# Maps GIDs to LDAP groups
+
+our %local_users;		# Users retrieved from local database
+our %local_groups;		# Groups retrieved from local database
+our %local_uids;		# Maps UIDs to local users
+our %local_gids;		# Maps GIDs to local groups
+
+our %overrides;			# pwent overrides
+our %wheel;			# members of wheel
+
+#
+# Print a message if in verbose mode.
+#
+sub verbose(@) {
+
+    if ($opt_v) {
+	my $msg = join('', @_);
+	$msg =~ s/\n*$/\n/s;
+	print(STDERR $msg);
+    }
+}
+
+sub verbose_pw($) {
+    my ($pw) = @_;
+
+    printf(STDERR "# %s:*:%d:%d:%s:%s:%s\n",
+	   @$pw{qw(name uid gid gecos home shell)})
+	if $opt_v;
+	       }
+
+sub verbose_gr($) {
+    my ($gr) = @_;
+
+    printf(STDERR "# %s:*:%d:%s\n", $$gr{name}, $$gr{gid},
+	   ref($$gr{members}) ?
+	   join(',', sort keys %{$$gr{members}}) :
+	   $$gr{members})
+	if $opt_v;
+}
+
+#
+# Quote a command line so it can be printed in a form that can be
+# executed.
+#
+sub quote(@) {
+    return map {
+	m/[\\!\#\&\(\)\;\<\>\[\\\]\`\{\|\}\~\s]/ ? "'" . s/([\'\\])/\\$1/gr . "'" : $_;
+    } @_;
+}
+
+#
+# Look up an SRV record
+# This was copied from srv2pf.pl and should probably go into a shared
+# module.
+#
+our $resolver;
+sub srv_lookup($$;$) {
+    my ($name, $service, $transport) = @_;
+
+    $transport //= "tcp";
+    $resolver //= Net::DNS::Resolver->new;
+    my $dnsname = "_$service._$transport.$name";
+    my $type = 'SRV';
+    verbose("# looking up $type for $dnsname");
+    my $query = $resolver->query($dnsname, $type, 'IN')
+	or return ();
+    my %answers;
+    map({ $answers{$_->target}++ } $query->answer);
+    return keys %answers;
+}
+
+#
+# Invoke pw(8)
+#
+sub pw(@) {
+    my @pw_cmd = ('/usr/sbin/pw', @_);
+    verbose(join(' ', quote(@pw_cmd)));
+    return ($opt_n || system(@pw_cmd) == 0);
+}
+
+#
+# Run an LDAP search and return the result as an array of lines.
+#
+sub ldap_search($;@) {
+    my ($filter, @attrs) = @_;
+
+    verbose("# Looking for $filter in $base");
+    my $page = new Net::LDAP::Control::Paged(size => $opt_P || 250);
+    my %records;
+    while (1) {
+	my $res = $ldap->search(base => $base,
+				filter => $filter,
+				attrs => @attrs ? \@attrs : undef,
+				control => [ $page ]);
+	if ($res->code()) {
+	    die("failed to search LDAP directory: " . $res->error . "\n");
+	}
+	%records = (%records, %{$res->as_struct()});
+	my $control = $res->control(LDAP_CONTROL_PAGED)
+	    or last;
+	my $cookie = $control->cookie
+	    or last;
+	verbose("# next page (", int(keys %records), ")");
+	$page->cookie($cookie);
+    }
+    verbose("# last page (", int(keys %records), ")");
+    return \%records;
+}
+
+#
+# Retrieve POSIX users from LDAP
+#
+sub get_ldap_users() {
+
+    verbose("# Retrieving users from LDAP");
+    my $res = ldap_search("(\&(objectclass=user)(uidnumber=*))");
+    my %users;
+    while (my ($dn, $obj) = each %$res) {
+	my %user;
+	$user{name} = $$obj{name}->[0];
+	$user{uid} = $$obj{uidnumber}->[0];
+	next if $user{name} eq 'nobody';
+	next if $opt_U && $user{name} !~ m/$opt_U/o;
+	next if $user{uid} < 1000;
+	$user{gid} = $$obj{gidnumber}->[0];
+	$user{gecos} = $$obj{displayname}->[0];
+	$user{home} = $overrides{home} // $$obj{unixhomedirectory}->[0];
+	$user{shell} = $overrides{shell} // $$obj{loginshell}->[0];
+	$ldap_users{$dn} = $ldap_uids{$user{uid}} = \%user;
+    }
+}
+
+#
+# Retrieve POSIX groups from LDAP
+#
+sub get_ldap_groups() {
+
+    verbose("# Retrieving groups from LDAP");
+    my $res = ldap_search("(\&(objectclass=group)(gidnumber=*))");
+    my %groups;
+    while (my ($dn, $obj) = each %$res) {
+	my %group;
+	$group{name} = $$obj{name}->[0];
+	$group{gid} = $$obj{gidnumber}->[0];
+	next if $group{name} eq 'nobody' || $group{name} eq 'nogroup';
+	next if $opt_G && $group{name} !~ m/$opt_G/o;
+	next if $group{gid} < 1000;
+	$group{memberdn} = $$obj{member};
+	$ldap_groups{$dn} = $ldap_gids{$group{gid}} = \%group;
+    }
+}
+
+#
+# Recursively resolve group membership
+#
+sub resolve_ldap_group($);
+sub resolve_ldap_group($) {
+    my ($group) = @_;
+
+    if (!$$group{members}) {
+	my %members;
+
+	# Recursively resolve members
+	foreach my $dn (@{$$group{memberdn}}) {
+	    if ($ldap_groups{$dn}) {
+		verbose("# $$group{name} member ",
+			"group $ldap_groups{$dn}->{name}");
+		foreach (resolve_ldap_group($ldap_groups{$dn})) {
+		    verbose("# $$group{name} member ",
+			    "user $$_{name} from member ",
+			    "group $ldap_groups{$dn}->{name}");
+		    $members{$$_{name}} = $_;
+		}
+	    } elsif ($ldap_users{$dn}) {
+		verbose("# $$group{name} member ",
+			"user $ldap_users{$dn}->{name}");
+		$members{$ldap_users{$dn}->{name}} = $ldap_users{$dn};
+	    } else {
+		verbose("# unknown member $dn in $$group{name}");
+	    }
+	}
+
+	# Replace DNs with member hashrefs
+	$$group{members} = \%members;
+	delete $$group{memberdn};
+
+	# Register with each member
+	foreach (values %members) {
+	    $$_{groups}->{$$group{name}} = $group;
+	}
+    }
+    return values %{$$group{members}};
+}
+
+#
+# Clean up the group data we got from LDAP
+#
+sub fixup_ldap_groups() {
+
+    # Recursively resolve group membership
+    verbose("# Resolving group membership");
+    foreach my $group (values %ldap_groups) {
+	resolve_ldap_group($group)
+	    if $$group{memberdn};
+    }
+
+    # There is no need to explicitly list users as members of their
+    # own primary filegroups, but it doesn't hurt.  Do this for all
+    # users, since the data from the LDAP server may be inconsistent.
+    foreach my $user (values %ldap_users) {
+	next unless $$user{gid} && $ldap_gids{$$user{gid}};
+	$ldap_gids{$$user{gid}}->{members}->{$$user{name}} = $user;
+    }
+
+    # Flatten group memberships
+    foreach my $group (values %ldap_groups) {
+	$$group{members} = join(',', sort keys %{$$group{members}});
+    }
+}
+
+#
+# Harvest user and group data from LDAP
+#
+sub harvest_ldap() {
+
+    # Retrieve user and group data
+    get_ldap_users();
+    get_ldap_groups();
+    fixup_ldap_groups();
+
+    # Change keys from DN to name
+    %ldap_users = map { $$_{name} => $_ } values %ldap_users;
+    %ldap_groups = map { $$_{name} => $_ } values %ldap_groups;
+}
+
+#
+# Retrieve POSIX users from local database
+#
+sub get_local_users() {
+
+    verbose("# Retrieving users from local database");
+    setpwent();
+    while (@_ = getpwent()) {
+	my %user;
+	@user{qw(name uid gid gecos home shell)} = @_[0, 2, 3, 6, 7, 8];
+	next if $user{uid} < 1000;
+	next if $user{name} eq 'nobody';
+	next if $opt_U && $user{name} !~ m/$opt_U/o;
+	$local_users{$user{name}} = $local_uids{$user{uid}} = \%user;
+    }
+    endpwent();
+}
+
+#
+# Retrieve POSIX groups from local database
+#
+sub get_local_groups() {
+
+    verbose("# Retrieving groups from local database");
+    setgrent();
+    while (@_ = getgrent()) {
+	my %group;
+	@group{qw(name gid)} = @_[0, 2];
+	next if $group{gid} < 1000;
+	next if $group{name} eq 'nobody' || $group{name} eq 'nogroup';
+	next if $opt_G && $group{name} !~ m/$opt_G/o;
+	$group{members} = {
+	    map { $_ => $local_users{$_} }
+	    grep { $local_users{$_} }
+	    split(' ', $_[3])
+	};
+	$local_groups{$group{name}} = $local_gids{$group{gid}} = \%group;
+    }
+    endgrent();
+}
+
+#
+# Clean up the group data we got from the local database
+#
+sub fixup_local_groups() {
+
+    # Perform the same normalization as we do for LDAP groups to avoid
+    # spurious changes.
+    foreach my $user (values %local_users) {
+	next unless $$user{gid} && $local_gids{$$user{gid}};
+	$local_gids{$$user{gid}}->{members}->{$$user{name}} = $user;
+    }
+
+    # Flatten group memberships
+    foreach my $group (values %local_groups) {
+	$$group{members} = join(',', sort keys %{$$group{members}});
+    }
+}
+
+#
+# Harvest local user and group data
+#
+sub harvest_local() {
+
+    get_local_users();
+    get_local_groups();
+    fixup_local_groups();
+}
+
+#
+# Create or modify a user
+#
+sub create_or_modify_user($) {
+    my ($user) = @_;
+
+    my $ldap_user = $ldap_users{$user};
+    my $local_user = $local_users{$user};
+    return if ($local_user && $ldap_user &&
+	       $$local_user{uid} == $$ldap_user{uid} &&
+	       $$local_user{gid} == $$ldap_user{gid} &&
+	       $$local_user{gecos} eq $$ldap_user{gecos} &&
+	       $$local_user{home} eq $$ldap_user{home} &&
+	       $$local_user{shell} eq $$ldap_user{shell});
+    verbose("# user $user ", $local_user ? "mismatch" : "missing");
+    verbose_pw($local_user)
+	if $local_user;
+    verbose_pw($ldap_user);
+    pw($local_user ? 'usermod' : 'useradd',
+       $$ldap_user{name},
+       '-u', $$ldap_user{uid},
+       '-g', $$ldap_user{gid},
+       '-c', $$ldap_user{gecos},
+       '-d', $$ldap_user{home},
+       '-s', $$ldap_user{shell})
+	or return 0;
+    # Update the cache to reflect the changes we made
+    $local_users{$user} = dclone($ldap_user);
+    return 1;
+}
+
+#
+# Delete a user
+#
+sub delete_user($) {
+    my ($user) = @_;
+
+    my $local_user = $local_users{$user};
+    return unless ($local_user);
+    if ($opt_p) {
+	verbose("# not deleting user $user");
+	return 1;
+    }
+    verbose("# deleting $user");
+    pw('userdel', $user)
+	or return 0;
+    # Update the cache to reflect the changes we made
+    delete $local_users{$user}
+}
+
+#
+# Create a group
+#
+sub create_group($) {
+    my ($group) = @_;
+
+    my $ldap_group = $ldap_groups{$group};
+    my $local_group = $local_groups{$group};
+    return if ($local_group);
+    verbose("# group $group missing");
+    pw('groupadd', $group, '-g', $$ldap_group{gid})
+	or return 0;
+    # Update the cache to reflect the changes we made
+    $local_groups{$group}->{name} = $$ldap_group{name};
+    $local_groups{$group}->{gid} = $$ldap_group{gid};
+    $local_groups{$group}->{members} = "";
+    return 1;
+}
+
+#
+# Create or modify a group
+#
+sub create_or_modify_group($) {
+    my ($group) = @_;
+
+    my $ldap_group = $ldap_groups{$group};
+    my $local_group = $local_groups{$group};
+    return unless $$ldap_group{members};
+    return if ($local_group && $ldap_group &&
+	       $$local_group{gid} == $$ldap_group{gid} &&
+	       $$local_group{members} eq $$ldap_group{members});
+    verbose("# group $group ", $local_group ? "mismatch" : "missing");
+    verbose_gr($local_group)
+	if $local_group;
+    verbose_gr($ldap_group);
+    pw($local_group ? 'groupmod' : 'groupadd',
+       $$ldap_group{name},
+       '-g', $$ldap_group{gid},
+       '-M', $$ldap_group{members})
+	or return 0;
+    # Update the cache to reflect the changes we made
+    $local_groups{$group} = dclone($ldap_group);
+    return 1;
+}
+
+#
+# Delete a group
+#
+sub delete_group($) {
+    my ($group) = @_;
+
+    my $local_group = $local_groups{$group};
+    return unless ($local_group);
+    if ($opt_p) {
+	verbose("# not deleting group $group");
+	return 1;
+    }
+    verbose("# deleting $group");
+    pw('groupdel', $group)
+	or return 0;
+    # Update the cache to reflect the changes we made
+    delete $local_groups{$group}
+}
+
+#
+# Print usage string and exit.
+#
+sub usage() {
+
+    print(STDERR
+	  "usage: ldap2pw [-npv] [-b base] [-d domain] [-s ldap server] [-u user]\n",
+	  "               [-P page size] [-G group filter] [-U user filter] [overrides]\n");
+    exit(1);
+}
+
+#
+# Main program - set defaults, validate and apply command-line
+# arguments, then iterate over specified groups.
+#
+MAIN:{
+    $ENV{PATH} = '';
+    if (!getopts('b:d:G:h:nP:ps:U:u:v') || $opt_h) {
+	usage();
+    }
+
+    # Overrides
+    foreach (@ARGV) {
+	m@^([a-z]+)=((?:/[0-9A-Za-z_.-]+)+)$@ or usage();
+	$overrides{$1} = $2;
+    }
+
+    # Hostname
+    $host = $opt_h // [ POSIX::uname() ]->[1];
+    die("invalid hostname: $host")
+	unless $host =~ m/^($RE{net}{domain})$/o;
+    verbose("# host: $host");
+
+    # Domain
+    if ($opt_d) {
+	$domain = $opt_d;
+    } else {
+	$domain = $1
+	    if $host =~ m/^[\w-]+\.((?:[\w-]+\.)*[\w-]+)\.?$/;
+	die("unable to derive domain from hostname\n")
+	    unless $domain;
+    }
+    die("invalid domain: $domain\n")
+	unless $domain =~ m/^($RE{net}{domain})$/o;
+    $domain = lc($1);
+    verbose("# domain: $domain");
+
+    # User
+    $user = $opt_u // POSIX::getlogin();
+    die("invalid user: $user\n")
+	unless $user =~ m/^([\w-]+(?:\@$RE{net}{domain})?)$/o;
+    $user = $1;
+    $user = "$user\@$domain"
+	unless $user =~ m/\@/;
+    verbose("# user: $user");
+
+    # LDAP servers
+    if ($opt_s) {
+	@servers = split(',', $opt_s);
+    } else {
+	@servers = srv_lookup($domain, 'ldap');
+	die("unable to retrieve LDAP servers from DNS\n")
+	    unless @servers;
+    }
+    foreach (@servers) {
+	die("invalid server: $_\n")
+	    unless m/^($RE{net}{domain})\.?$/o;
+	$_ = $1;
+    }
+    verbose("# servers: ", join(' ', @servers));
+
+    # Search base
+    if ($opt_b) {
+	die("invalid base: $opt_b\n")
+	    unless $opt_b =~ m/^(DC=[0-9a-z-]+(?:,DC=[0-9a-z-]+)*)$/o;
+	$base = $1;
+    } else {
+	$base = join(',', map({ "DC=$_" } split(/[.]/, $domain)));
+    }
+    verbose("# base: $base");
+
+    # Connect to LDAP server
+    foreach (@servers) {
+	verbose("# Attempting to connect to $_");
+	try {
+	    $sasl = new Authen::SASL(mechanism => 'GSSAPI',
+				     callback => {
+					 user => $user,
+					 password => '',
+				     });
+	    $sasl = $sasl->client_new('ldap', $_);
+	    $ldap = new Net::LDAP($_, onerror => 'die')
+		or die("$@\n");
+	    $ldap->bind(sasl => $sasl);
+	} catch {
+	    verbose("# unable to connect to LDAP server: $_\n");
+	    $ldap = undef;
+	};
+	last if $ldap;
+    }
+    die("failed to connect to an LDAP server\n")
+	unless $ldap;
+
+    # Retrieve data from LDAP
+    harvest_ldap();
+    harvest_local();
+
+    # Members of wheel are untouchable
+    map { $wheel{$_} = $_ } split(' ', (getgrnam('wheel'))[3]);
+
+    #
+    # Create / modify users and groups.
+    #
+    # Note that we have to create new groups first, otherwise user
+    # creation will fail because the user's primary file group does
+    # not exist.
+    #
+    # Deletion is not yet implemented.
+    #
+    foreach my $group (sort keys %ldap_groups) {
+	create_group($group);
+    }
+    foreach my $user (sort keys %ldap_users) {
+	next if $wheel{$user};
+	create_or_modify_user($user);
+    }
+    foreach my $group (sort keys %ldap_groups) {
+	create_or_modify_group($group);
+    }
+
+    #
+    # Delete local users and groups that are missing from LDAP.
+    #
+    foreach my $user (sort keys %local_users) {
+	next if exists $ldap_users{$user};
+	delete_user($user);
+    }
+    foreach my $group (sort keys %local_groups) {
+	next if exists $ldap_groups{$group};
+	delete_group($group);
+    }
+
+    # Work around bug in Net::LDAP
+    $SIG{__DIE__} = sub { exit 0 };
+}
