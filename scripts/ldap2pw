@@ -47,6 +47,8 @@ use Regexp::Common;
 use Storable qw(dclone);
 use Try::Tiny;
 
+our $VERSION = '20151106';
+
 our $opt_b;			# LDAP base
 our $opt_d;			# LDAP domain
 our $opt_G;			# Group filter
@@ -495,8 +497,9 @@ sub delete_group($) {
 sub usage() {
 
     print(STDERR
-	  "usage: ldap2pw [-npv] [-b base] [-d domain] [-s ldap server] [-u user]\n",
-	  "               [-P page size] [-G group filter] [-U user filter] [overrides]\n");
+	  "usage: ldap2pf [-npv] [-b base] [-d domain] [-h host]\n",
+	  "           [-P page size] [-s servers] [-u user]\n",
+	  "           [-G group filter] [-U user filter] [overrides]\n");
     exit(1);
 }
 
@@ -634,3 +637,209 @@ MAIN:{
     # Work around bug in Net::LDAP
     $SIG{__DIE__} = sub { exit 0 };
 }
+
+__END__
+
+=encoding utf8
+
+=head1 NAME
+
+B<ldap2pw> - Synchronize local user database with LDAP directory
+
+=head1 SYNOPSIS
+
+B<ldap2pw> [B<-npv>] S<[B<-b> I<base>]> S<[B<-d> I<domain>]> S<[B<-h> I<host>]> S<[B<-P> I<page size>]> S<[B<-s> I<servers>]> S<[B<-u> I<user>[I<@domain>]]> S<[B<-G> I<group filter>]> S<[B<-U> I<user filter>]> [I<overrides>]
+
+=head1 DESCRIPTION
+
+The B<ldap2pw> utility synchronizes the local user database with an
+LDAP directory.  It is intended for systems where NSS modules cannot
+be used or access to the LDAP server is intermittent.
+
+The B<ldap2pw> utility starts by searching the LDAP directory for user
+objects that have a I<UIDNumber> attribute and group objects that have
+a I<GIDNumber> attribute.  Next, it reads the local user and group
+database.  The users and groups obtained from both the LDAP directory
+and the local database are filtered according to the following
+criteria:
+
+=over
+
+=item
+
+Users with a UID below 1000 are ignored.
+
+=item
+
+Any user named B<nobody> is ignored.
+
+=item
+
+If a user filter was specified, users whose names do not match the
+filter are ignored.
+
+=item
+
+Groups with a GID below 1000 are ignored.
+
+=item
+
+Any groups named B<nobody> or B<nogroup> are ignored.
+
+=item
+
+If a group filter was specified, groups whose names do not match the
+filter are ignored.
+
+=back
+
+Finally, the two lists are compared and the local database is updated
+as follows:
+
+=over
+
+=item 1
+
+Groups which were found in the LDAP directory but not in the local
+database are created.
+
+=item 2
+
+Users which were found in the LDAP directory but not in the local
+database are created.
+
+=item 3
+
+Existing users whose attributes (UID, primary group, GECOS, home
+directory and shell) do not match those found in the LDAP directory
+are updated.
+
+=item 4
+
+Existing groups whose attributed (GID and membership) do not match
+those found in the LDAP directory are updated.
+
+=item 5
+
+Users and groups which were found in the local database but not in the
+LDAP directory are deleted, unless the B<-p> option was specified, in
+which case they are simply ignored.
+
+=back
+
+The following options are available:
+
+=over
+
+=item B<-b> I<base>
+
+The search base for LDAP lookups.  The default is derived from the
+LDAP domain.
+
+=item B<-d> I<domain>
+
+The LDAP domain.  The default is derived from the host name.
+
+=item B<-G> I<group filter>
+
+Regular expression used to filter groups before comparing the local
+and remote databases.
+
+=item B<-h> I<host>
+
+The client's host name.  The default is whatever L<uname(3)> returns.
+
+=item B<-n>
+
+Perform all LDAP and local lookups, compare the lists, and show what
+would be done, but do not actually create, modify or delete any users
+or groups.
+
+=item B<-P> I<page size>
+
+The page size to use for LDAP requests.  The default is 250.
+
+=item B<-p>
+
+Preserve existing users and groups even if they are no longer found in
+the LDAP directory.
+
+=item B<-s> I<servers>
+
+A comma-separated list of LDAP server names.  The default is to
+perform an I<SRV> lookup.
+
+=item B<-U> I<user filter>
+
+Regular expression used to filter users before comparing the local and
+remote databases.
+
+=item B<-u> I<user>[I<@domain>]
+
+The user name used to bind to the LDAP server, with or without domain
+qualifier.  The default is the name of the current user.
+
+=item B<-v>
+
+Show progress and debugging information.
+
+=back
+
+Any subsequent arguments are taken as key-value pairs which override
+the user attributes found in LDAP.  Currently, only the home directory
+(I<home>) and the login shell (I<shell>) can be overridden.
+
+=head1 IMPLEMENTATION NOTES
+
+The B<ldap2pw> utility was designed for use with Microsoft Active
+Directory servers, and assumes that the server supports and requires
+GSSAPI authentication and that a valid Kerberos ticket is available.
+
+=head1 EXAMPLES
+
+Synchronize the local user and group database on a firewall that uses
+L<authpf(8)>:
+
+    % sudo env KRB5CCNAME=/var/db/ro_user.cc ldap2pw -pv -u ro_user home=/var/empty shell=/usr/sbin/authpf
+    # host: client.example.com
+    # domain: example.com
+    # user: ro_user@example.com
+    # looking up SRV for _ldap._tcp.example.com
+    # servers: dc01.example.com dc02.example.com
+    # base: DC=example,DC=com
+    # Attempting to connect to dc01.example.com
+    # Retrieving users from LDAP
+    # Looking for (&(objectclass=user)(uidnumber=*)) in DC=example,DC=com
+    # last page (3)
+    # Retrieving groups from LDAP
+    # Looking for (&(objectclass=group)(gidnumber=*)) in DC=example,DC=com
+    # last page (4)
+    # Resolving group membership
+    # bob member user bob
+    # des member user des
+    # kenneth member user kenneth
+    # staff member user bob
+    # staff member user des
+    # staff member user kenneth
+    # Retrieving users from local database
+    # Retrieving groups from local database
+    # group kenneth missing
+    /usr/sbin/pw groupadd kenneth -g 1003
+    # user kenneth missing
+    /usr/sbin/pw useradd kenneth -u 1003 -g 1003 -c 'Kenneth 36' -d /var/empty -s /usr/sbin/authpf
+    # group kenneth mismatch
+    /usr/sbin/pw groupmod kenneth -g 1003 -M kenneth
+    # group staff mismatch
+    /usr/sbin/pw groupmod staff -g 1000 -M bob,des,kenneth
+    # not deleting group guests
+
+=head1 SEE ALSO
+
+L<kinit(1)>, L<pw(8)>
+
+=head1 AUTHOR
+
+The B<ldap2pw> utility was written by Dag-Erling Smørgrav
+<d.e.smorgrav@usit.uio.no> for the University of Oslo.
+
+=cut

@@ -9,7 +9,7 @@ use ExtUtils::MakeMaker;
 
 WriteMakefile(
     NAME		=> 'UiO::LDAP2PW',
-    VERSION		=> 20151101,
+    VERSION_FROM	=> 'scripts/ldap2pw',
     ABSTRACT		=> 'Synchronize local user database with LDAP directory',
     AUTHOR		=> [ 'Dag-Erling Smørgrav <d.e.smorgrav@usit.uio.no>' ],
     MIN_PERL_VERSION	=> v5.14,
