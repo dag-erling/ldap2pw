@@ -1,6 +1,6 @@
 #!/usr/bin/perl -Tw
 #-
-# Copyright (c) 2013-2015 Universitetet i Oslo
+# Copyright (c) 2013-2017 Universitetet i Oslo
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -47,7 +47,7 @@ use Regexp::Common;
 use Storable qw(dclone);
 use Try::Tiny;
 
-our $VERSION = '20151106';
+our $VERSION = '20170906';
 
 our $opt_b;			# LDAP base
 our $opt_d;			# LDAP domain
@@ -497,7 +497,7 @@ sub delete_group($) {
 sub usage() {
 
     print(STDERR
-	  "usage: ldap2pf [-npv] [-b base] [-d domain] [-h host]\n",
+	  "usage: ldap2pw [-npv] [-b base] [-d domain] [-h host]\n",
 	  "           [-P page size] [-s servers] [-u user]\n",
 	  "           [-G group filter] [-U user filter] [overrides]\n");
     exit(1);
@@ -509,7 +509,7 @@ sub usage() {
 #
 MAIN:{
     $ENV{PATH} = '';
-    if (!getopts('b:d:G:h:nP:ps:U:u:v') || $opt_h) {
+    if (!getopts('b:d:G:h:nP:ps:U:u:v')) {
 	usage();
     }
 
