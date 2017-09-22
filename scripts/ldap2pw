@@ -47,7 +47,7 @@ use Regexp::Common;
 use Storable qw(dclone);
 use Try::Tiny;
 
-our $VERSION = '20170906';
+our $VERSION = '20170922';
 
 our $opt_b;			# LDAP base
 our $opt_d;			# LDAP domain
@@ -193,14 +193,19 @@ sub get_ldap_users() {
     while (my ($dn, $obj) = each %$res) {
 	my %user;
 	$user{name} = $$obj{name}->[0];
-	$user{uid} = $$obj{uidnumber}->[0];
+	next unless defined($user{name});
 	next if $user{name} eq 'nobody';
 	next if $opt_U && $user{name} !~ m/$opt_U/o;
+	$user{uid} = $$obj{uidnumber}->[0];
+	next unless defined($user{uid});
 	next if $user{uid} < 1000;
 	$user{gid} = $$obj{gidnumber}->[0];
-	$user{gecos} = $$obj{displayname}->[0];
+	next unless defined($user{gid});
+	$user{gecos} = $$obj{displayname}->[0] // $user{name};
 	$user{home} = $overrides{home} // $$obj{unixhomedirectory}->[0];
+	next unless defined($user{home});
 	$user{shell} = $overrides{shell} // $$obj{loginshell}->[0];
+	next unless defined($user{shell});
 	$ldap_users{$dn} = $ldap_uids{$user{uid}} = \%user;
     }
 }
@@ -216,11 +221,13 @@ sub get_ldap_groups() {
     while (my ($dn, $obj) = each %$res) {
 	my %group;
 	$group{name} = $$obj{name}->[0];
-	$group{gid} = $$obj{gidnumber}->[0];
+	next unless defined($group{name});
 	next if $group{name} eq 'nobody' || $group{name} eq 'nogroup';
 	next if $opt_G && $group{name} !~ m/$opt_G/o;
+	$group{gid} = $$obj{gidnumber}->[0];
+	next unless defined($group{gid});
 	next if $group{gid} < 1000;
-	$group{memberdn} = $$obj{member};
+	$group{memberdn} = $$obj{member} // [];
 	$ldap_groups{$dn} = $ldap_gids{$group{gid}} = \%group;
     }
 }
